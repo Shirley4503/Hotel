@@ -2,9 +2,13 @@
 A Streamlit-based AI agent that lets hotel staff ask natural-language questions about rooms, reservations, events, billing, reports, and access logs, then automatically queries the hotel database and returns operational insights.
 
 User Question
+
 ↓
+
 ChromaDB RAG Skill
+
 从 knowledge_base 里检索相关 schema / business rules / KPI / anomaly rules
+
 ↓
 SQL Agent
 LLM 根据用户问题 + ChromaDB context + database schema 生成 SQLite SELECT query
