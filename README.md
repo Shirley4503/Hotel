@@ -1,1 +1,1 @@
-# Hotel
+# HotelMind: Multi-Agent Hotel Operations Assistant
