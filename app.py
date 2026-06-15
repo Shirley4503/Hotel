@@ -1,451 +1,417 @@
-from flask import Flask, render_template, request, redirect, url_for
-import sqlite3
-from datetime import datetime
+import os
+import streamlit as st
+import pandas as pd
 
-app = Flask(__name__)
+from skills.sql_generation_skill import answer_with_generated_sql
+from skills.fixed_report_skill import (
+    get_summary_stats,
+    revenue_by_service,
+    room_status_summary,
+    recent_access_logs,
+)
+from tools.schema_tool import get_database_schema
+from skills.chroma_rag_skill import retrieve_context_chroma
+from data.build_chroma import build_chroma
 
-def get_db_connection():
-    conn = sqlite3.connect("hotel.db")
-    conn.row_factory = sqlite3.Row
-    return conn
 
-def get_summary_stats():
-    conn = get_db_connection()
-    stats = {
-        "building_count": conn.execute("SELECT COUNT(*) AS count FROM building").fetchone()["count"],
-        "room_count": conn.execute("SELECT COUNT(*) AS count FROM room").fetchone()["count"],
-        "available_room_count": conn.execute("SELECT COUNT(*) AS count FROM room WHERE roomStatus = 'available'").fetchone()["count"],
-        "event_count": conn.execute("SELECT COUNT(*) AS count FROM event").fetchone()["count"],
-        "total_revenue": conn.execute("SELECT ROUND(COALESCE(SUM(amount), 0), 2) AS total FROM charge").fetchone()["total"]
-    }
-    conn.close()
-    return stats
+st.set_page_config(
+    page_title="HotelMind AI",
+    page_icon="🏨",
+    layout="wide",
+)
 
-@app.route("/")
-def home():
-    return render_template("index.html", stats=get_summary_stats())
 
-@app.route("/rooms")
-def rooms():
-    conn = get_db_connection()
-    rooms = conn.execute("""
-        SELECT r.roomID, r.roomNumber, r.baseRate, r.roomStatus,
-               f.floorNumber, w.wingName, b.buildingName
-        FROM room r
-        JOIN floor f ON r.floorID = f.floorID
-        JOIN wing w ON f.wingID = w.wingID
-        JOIN building b ON w.buildingID = b.buildingID
-        ORDER BY b.buildingName, w.wingName, f.floorNumber, r.roomNumber
-    """).fetchall()
-    conn.close()
-    return render_template("rooms.html", rooms=rooms)
+# -----------------------------
+# Helper functions
+# -----------------------------
 
-@app.route("/room/<int:room_id>")
-def room_detail(room_id):
-    conn = get_db_connection()
-
-    room = conn.execute("""
-        SELECT r.roomID, r.roomNumber, r.baseRate, r.roomStatus,
-               f.floorNumber, f.smokingDesignation,
-               w.wingName, w.proximityPool, w.proximityParking, w.handicappedAccess,
-               b.buildingName,
-               srd.capacity, srd.smoking, srd.hasToilet, srd.hasTV, srd.hasPhone,
-               mrd.seatingCapacity
-        FROM room r
-        JOIN floor f ON r.floorID = f.floorID
-        JOIN wing w ON f.wingID = w.wingID
-        JOIN building b ON w.buildingID = b.buildingID
-        LEFT JOIN sleeping_room_details srd ON r.roomID = srd.roomID
-        LEFT JOIN meeting_room_details mrd ON r.roomID = mrd.roomID
-        WHERE r.roomID = ?
-    """, (room_id,)).fetchone()
-
-    if room is None:
-        conn.close()
-        return render_template("error.html", error="Room not found.")
-
-    beds = conn.execute("""
-        SELECT bt.size, rb.quantity
-        FROM room_bed rb
-        JOIN bed_type bt ON rb.bedTypeId = bt.bedTypeId
-        WHERE rb.roomId = ?
-    """, (room_id,)).fetchall()
-
-    adjacent_rooms = conn.execute("""
-        SELECT r.roomNumber, ra.hasPrivateDoor
-        FROM room_adjacency ra
-        JOIN room r ON ra.roomId2 = r.roomID
-        WHERE ra.roomId1 = ?
-        UNION
-        SELECT r.roomNumber, ra.hasPrivateDoor
-        FROM room_adjacency ra
-        JOIN room r ON ra.roomId1 = r.roomID
-        WHERE ra.roomId2 = ?
-    """, (room_id, room_id)).fetchall()
-
-    room_image = "default-room.jpg"
-    if room["buildingName"] == "Conference Center":
-        room_image = "meeting-room.jpg"
-    elif room["baseRate"] >= 220:
-        room_image = "suite-room.jpg"
-    elif room["baseRate"] >= 150:
-        room_image = "standard-room.jpg"
-
-    conn.close()
-    return render_template("room_detail.html", room=room, beds=beds, adjacent_rooms=adjacent_rooms, room_image=room_image)
-
-@app.route("/availability", methods=["GET", "POST"])
-def availability():
-    available_rooms = None
-    start = None
-    end = None
-
-    if request.method == "POST":
-        start = request.form.get("start")
-        end = request.form.get("end")
-
-        conn = get_db_connection()
-        available_rooms = conn.execute("""
-            SELECT r.roomID, r.roomNumber, r.baseRate, r.roomStatus
-            FROM room r
-            WHERE r.roomStatus = 'available'
-              AND r.roomID NOT IN (
-                SELECT rr.roomId
-                FROM room_reservation rr
-                WHERE rr.startDateTime < ?
-                  AND rr.endDateTime > ?
-            )
-            ORDER BY r.roomNumber
-        """, (end, start)).fetchall()
-        conn.close()
-
-    return render_template("availability.html", available_rooms=available_rooms, start=start, end=end)
-
-@app.route("/events", methods=["GET", "POST"])
-def events():
-    conn = get_db_connection()
-
-    keyword = request.form.get("keyword", "").strip() if request.method == "POST" else ""
-    date = request.form.get("date", "").strip() if request.method == "POST" else ""
-
-    query = """
-        SELECT e.eventId, e.startDate, e.endDate,
-               e.estimatedAttendance, e.estimatedGuestRooms,
-               p.first_name, p.last_name,
-               r.roomNumber, er.usageSlot
-        FROM event e
-        JOIN host h ON e.hostId = h.hostId
-        JOIN person p ON h.hostId = p.personId
-        JOIN event_room er ON e.eventId = er.eventId
-        JOIN room r ON er.roomId = r.roomID
-        WHERE 1 = 1
+def has_openai_key() -> bool:
     """
-    params = []
+    Check whether OpenAI API key exists either in Streamlit Secrets or environment variables.
+    """
+    try:
+        if st.secrets.get("OPENAI_API_KEY"):
+            return True
+    except Exception:
+        pass
 
-    if keyword:
-        query += " AND (p.first_name LIKE ? OR p.last_name LIKE ?)"
-        params.extend([f"%{keyword}%", f"%{keyword}%"])
+    return bool(os.getenv("OPENAI_API_KEY"))
 
-    if date:
-        query += " AND date(e.startDate) <= date(?) AND date(e.endDate) >= date(?)"
-        params.extend([date, date])
 
-    query += " ORDER BY e.eventId, er.usageSlot"
-
-    events = conn.execute(query, params).fetchall()
-
-    summary = conn.execute("""
-        SELECT COUNT(*) AS totalEvents,
-               COALESCE(SUM(estimatedAttendance), 0) AS totalAttendance,
-               COALESCE(SUM(estimatedGuestRooms), 0) AS totalGuestRooms
-        FROM event
-    """).fetchone()
-
-    conn.close()
-    return render_template("events.html", events=events, summary=summary, keyword=keyword, date=date)
-
-@app.route("/access")
-def access():
-    conn = get_db_connection()
-
-    access_logs = conn.execute("""
-        SELECT cal.logId, cal.cardId, r.roomNumber,
-               cal.accessTime, cal.direction,
-               p.first_name, p.last_name
-        FROM card_access_log cal
-        JOIN access_card ac ON cal.cardId = ac.cardId
-        JOIN person p ON ac.guestId = p.personId
-        JOIN room r ON cal.roomId = r.roomID
-        ORDER BY cal.accessTime DESC
-    """).fetchall()
-
-    conn.close()
-    return render_template("access.html", access_logs=access_logs)
-
-@app.route("/checkin", methods=["GET", "POST"])
-def checkin():
-    conn = get_db_connection()
-
-    if request.method == "POST":
-        action = request.form.get("action")
-
-        if action == "checkin":
-            guest_id = request.form.get("guestId")
-            room_id = request.form.get("roomId")
-            check_in = request.form.get("checkIn")
-            check_out = request.form.get("checkOut")
-            next_id = conn.execute("SELECT COALESCE(MAX(stayId), 0) + 1 AS nextId FROM stay").fetchone()["nextId"]
-
-            conn.execute("INSERT INTO stay VALUES (?, ?, ?, ?)", (next_id, guest_id, check_in, check_out))
-            conn.execute("INSERT INTO room_assignment VALUES (?, ?, ?, ?)", (next_id, room_id, check_in, check_out))
-            conn.execute("UPDATE room SET roomStatus = 'occupied' WHERE roomID = ?", (room_id,))
-            conn.commit()
-
-        elif action == "checkout":
-            stay_id = request.form.get("stayId")
-            checkout_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-            room = conn.execute("SELECT roomId FROM room_assignment WHERE stayId = ? LIMIT 1", (stay_id,)).fetchone()
-            conn.execute("UPDATE stay SET checkOut = ? WHERE stayId = ?", (checkout_time, stay_id))
-            conn.execute("UPDATE room_assignment SET assignedTo = ? WHERE stayId = ?", (checkout_time, stay_id))
-
-            if room:
-                conn.execute("UPDATE room SET roomStatus = 'cleaning' WHERE roomID = ?", (room["roomId"],))
-
-            conn.commit()
-
-        conn.close()
-        return redirect(url_for("checkin"))
-
-    guests = conn.execute("""
-        SELECT g.guestId, p.first_name, p.last_name
-        FROM guest g
-        JOIN person p ON g.guestId = p.personId
-        ORDER BY p.last_name
-    """).fetchall()
-
-    rooms = conn.execute("""
-        SELECT roomID, roomNumber, roomStatus
-        FROM room
-        ORDER BY roomNumber
-    """).fetchall()
-
-    active_stays = conn.execute("""
-        SELECT s.stayId, p.first_name, p.last_name, r.roomNumber, s.checkIn, s.checkOut
-        FROM stay s
-        JOIN person p ON s.guestId = p.personId
-        JOIN room_assignment ra ON s.stayId = ra.stayId
-        JOIN room r ON ra.roomId = r.roomID
-        ORDER BY s.stayId DESC
-    """).fetchall()
-
-    conn.close()
-    return render_template("checkin.html", guests=guests, rooms=rooms, active_stays=active_stays)
-
-@app.route("/maintenance", methods=["GET", "POST"])
-def maintenance():
-    conn = get_db_connection()
-
-    if request.method == "POST":
-        room_id = request.form.get("roomId")
-        status = request.form.get("roomStatus")
-        conn.execute("UPDATE room SET roomStatus = ? WHERE roomID = ?", (status, room_id))
-        conn.commit()
-
-    rooms = conn.execute("""
-        SELECT r.roomID, r.roomNumber, r.roomStatus,
-               f.floorNumber, w.wingName, b.buildingName
-        FROM room r
-        JOIN floor f ON r.floorID = f.floorID
-        JOIN wing w ON f.wingID = w.wingID
-        JOIN building b ON w.buildingID = b.buildingID
-        ORDER BY r.roomNumber
-    """).fetchall()
-
-    conn.close()
-    return render_template("maintenance.html", rooms=rooms)
-
-@app.route("/guests", methods=["GET", "POST"])
-def guest_lookup():
-    conn = get_db_connection()
-    keyword = request.form.get("keyword") if request.method == "POST" else ""
-    guests = []
-    stays = []
-    charges = []
-
-    if keyword:
-        guests = conn.execute("""
-            SELECT g.guestId, p.first_name, p.last_name, p.phone, p.email
-            FROM guest g
-            JOIN person p ON g.guestId = p.personId
-            WHERE p.first_name LIKE ? OR p.last_name LIKE ?
-            ORDER BY p.last_name
-        """, (f"%{keyword}%", f"%{keyword}%")).fetchall()
-
-        if guests:
-            guest_id = guests[0]["guestId"]
-
-            stays = conn.execute("""
-                SELECT s.stayId, s.checkIn, s.checkOut, r.roomNumber
-                FROM stay s
-                LEFT JOIN room_assignment ra ON s.stayId = ra.stayId
-                LEFT JOIN room r ON ra.roomId = r.roomID
-                WHERE s.guestId = ?
-                ORDER BY s.checkIn DESC
-            """, (guest_id,)).fetchall()
-
-            charges = conn.execute("""
-                SELECT c.chargeId, sv.serviceType, c.amount, c.chargeDateTime, c.description
-                FROM charge c
-                JOIN service sv ON c.serviceId = sv.serviceId
-                JOIN stay s ON c.stayId = s.stayId
-                WHERE s.guestId = ?
-                ORDER BY c.chargeDateTime DESC
-            """, (guest_id,)).fetchall()
-
-    conn.close()
-    return render_template("guest_lookup.html", keyword=keyword, guests=guests, stays=stays, charges=charges)
-
-@app.route("/billing", methods=["GET", "POST"])
-def billing():
-    conn = get_db_connection()
-
-    keyword = request.form.get("keyword", "").strip() if request.method == "POST" else ""
-
-    where_clause = ""
-    params = []
-
-    if keyword:
-        where_clause = """
-            WHERE CAST(bp.billingPartyId AS TEXT) LIKE ?
-               OR p.first_name LIKE ?
-               OR p.last_name LIKE ?
-               OR CAST(o.organizationId AS TEXT) LIKE ?
+def show_project_intro():
+    st.markdown(
         """
-        params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+        **HotelMind AI** is a ChromaDB-RAG and LLM-generated SQL agent for hotel operations.
 
-    billing_totals = conn.execute(f"""
-        SELECT bp.billingPartyId, p.first_name, p.last_name, o.organizationId,
-               ROUND(SUM(c.amount), 2) AS totalAmount
-        FROM billing_party bp
-        JOIN charge c ON bp.billingPartyId = c.billingPartyId
-        LEFT JOIN person p ON bp.personId = p.personId
-        LEFT JOIN organization o ON bp.organizationId = o.organizationId
-        {where_clause}
-        GROUP BY bp.billingPartyId
-        ORDER BY totalAmount DESC
-    """, params).fetchall()
-
-    charges = conn.execute("""
-        SELECT c.chargeId, sv.serviceType, c.amount, c.chargeDateTime,
-               c.stayId, c.eventId, c.description,
-               bp.billingPartyId,
-               p.first_name, p.last_name, o.organizationId
-        FROM charge c
-        JOIN service sv ON c.serviceId = sv.serviceId
-        JOIN billing_party bp ON c.billingPartyId = bp.billingPartyId
-        LEFT JOIN person p ON bp.personId = p.personId
-        LEFT JOIN organization o ON bp.organizationId = o.organizationId
-        ORDER BY c.chargeDateTime DESC
-    """).fetchall()
-
-    summary = conn.execute("""
-        SELECT COUNT(DISTINCT billingPartyId) AS partyCount,
-               COUNT(*) AS chargeCount,
-               ROUND(COALESCE(SUM(amount), 0), 2) AS totalAmount
-        FROM charge
-    """).fetchone()
-
-    conn.close()
-
-    return render_template(
-        "billing.html",
-        billing_totals=billing_totals,
-        charges=charges,
-        summary=summary,
-        keyword=keyword
+        It can:
+        - retrieve relevant hotel schema and business rules from ChromaDB;
+        - generate safe SQLite `SELECT` queries with an LLM;
+        - query `hotel.db`;
+        - explain results as a hotel operations analyst;
+        - show dashboard insights even without the OpenAI API key.
+        """
     )
 
-@app.route("/reports")
-def reports():
-    conn = get_db_connection()
 
-    revenue_by_service = conn.execute("""
-        SELECT s.serviceType, ROUND(SUM(c.amount), 2) AS revenue
-        FROM charge c
-        JOIN service s ON c.serviceId = s.serviceId
-        GROUP BY s.serviceType
-        ORDER BY revenue DESC
-    """).fetchall()
+def show_api_key_warning():
+    if not has_openai_key():
+        st.warning(
+            """
+            OpenAI API key is not detected.  
+            The Dashboard and ChromaDB build features can still run, but the LLM SQL Agent will not work yet.
 
-    revenue_by_room = conn.execute("""
-        SELECT r.roomNumber, ROUND(SUM(c.amount), 2) AS totalRevenue
-        FROM charge c
-        JOIN room r ON c.roomId = r.roomID
-        GROUP BY r.roomID
-        ORDER BY totalRevenue DESC
-    """).fetchall()
+            On Streamlit Cloud, add this under **App settings → Secrets**:
 
-    room_status = conn.execute("""
-        SELECT roomStatus, COUNT(*) AS count
-        FROM room
-        GROUP BY roomStatus
-    """).fetchall()
+            ```toml
+            OPENAI_API_KEY = "your_real_key_here"
+            OPENAI_MODEL = "gpt-4o-mini"
+            ```
+            """
+        )
 
-    guests_multiple_stays = conn.execute("""
-        SELECT s.guestId, p.first_name, p.last_name, COUNT(*) AS stayCount
-        FROM stay s
-        JOIN person p ON s.guestId = p.personId
-        GROUP BY s.guestId
-        HAVING COUNT(*) > 1
-    """).fetchall()
 
-    event_schedule = conn.execute("""
-        SELECT e.eventId, e.startDate, e.endDate, r.roomNumber, er.usageSlot
-        FROM event e
-        JOIN event_room er ON e.eventId = er.eventId
-        JOIN room r ON er.roomId = r.roomID
-        ORDER BY e.eventId, er.usageSlot
-    """).fetchall()
+# -----------------------------
+# Sidebar
+# -----------------------------
 
-    charges_with_owner = conn.execute("""
-        SELECT c.chargeId, c.amount, c.chargeDateTime, c.description,
-               s.serviceType, r.roomNumber, c.stayId, c.eventId,
-               p.first_name, p.last_name, o.organizationId,
-               CASE
-                   WHEN c.stayId IS NOT NULL THEN 'Stay'
-                   WHEN c.eventId IS NOT NULL THEN 'Event'
-                   ELSE 'Unknown'
-               END AS belongsTo
-        FROM charge c
-        LEFT JOIN service s ON c.serviceId = s.serviceId
-        LEFT JOIN room r ON c.roomId = r.roomID
-        LEFT JOIN billing_party bp ON c.billingPartyId = bp.billingPartyId
-        LEFT JOIN person p ON bp.personId = p.personId
-        LEFT JOIN organization o ON bp.organizationId = o.organizationId
-        ORDER BY c.chargeId
-    """).fetchall()
+st.sidebar.title("🏨 HotelMind AI")
 
-    conn.close()
+st.sidebar.markdown(
+    """
+    **Agent Architecture**
+    
+    1. ChromaDB RAG Skill  
+    2. LLM SQL Generation Skill  
+    3. SQL Safety QC Skill  
+    4. SQLite Database Query Tool  
+    5. Hotel Operations Analyst Agent  
+    """
+)
 
-    return render_template(
-        "reports.html",
-        revenue_by_service=revenue_by_service,
-        revenue_by_room=revenue_by_room,
-        guests_multiple_stays=guests_multiple_stays,
-        event_schedule=event_schedule,
-        charges_with_owner=charges_with_owner,
-        service_labels=[r["serviceType"] for r in revenue_by_service],
-        service_data=[r["revenue"] for r in revenue_by_service],
-        room_labels=[r["roomNumber"] for r in revenue_by_room[:8]],
-        room_data=[r["totalRevenue"] for r in revenue_by_room[:8]],
-        status_labels=[r["roomStatus"] for r in room_status],
-        status_data=[r["count"] for r in room_status]
+st.sidebar.divider()
+
+st.sidebar.markdown("### Setup Checklist")
+st.sidebar.markdown(
+    """
+    - `hotel.db` uploaded  
+    - `knowledge_base/*.md` added  
+    - `requirements.txt` includes `chromadb`  
+    - ChromaDB built  
+    - OpenAI key added in Streamlit Secrets  
+    """
+)
+
+st.sidebar.divider()
+
+if has_openai_key():
+    st.sidebar.success("OpenAI API key detected")
+else:
+    st.sidebar.warning("OpenAI API key not detected")
+
+
+# -----------------------------
+# Main page
+# -----------------------------
+
+st.title("🏨 HotelMind AI")
+st.caption("ChromaDB RAG + LLM-generated SQL + Skills for Hotel Operations Intelligence")
+
+show_project_intro()
+show_api_key_warning()
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "Ask HotelMind",
+        "Dashboard",
+        "Build / Test ChromaDB",
+        "Database Schema",
+        "About Skills",
+    ]
+)
+
+
+# -----------------------------
+# Tab 1: Ask HotelMind
+# -----------------------------
+
+with tab1:
+    st.subheader("Ask HotelMind")
+
+    st.markdown(
+        """
+        Ask a natural-language question about the hotel database.  
+        HotelMind will retrieve relevant rules from ChromaDB, generate SQL, check SQL safety, query `hotel.db`, and explain the result.
+        """
     )
 
-@app.errorhandler(Exception)
-def handle_error(e):
-    return render_template("error.html", error=str(e)), 500
+    example_questions = [
+        "Which service types generate the most revenue?",
+        "Show the top 10 rooms by total revenue.",
+        "Which rooms are currently available?",
+        "Show recent card access logs.",
+        "Which billing parties have the highest total charges?",
+        "Show event room usage by date.",
+        "Find guests with multiple stays.",
+        "Show room status breakdown.",
+        "Which events have the highest estimated attendance?",
+        "Show charges related to events.",
+        "Which rooms are near the pool?",
+        "Show guests and their stay history.",
+    ]
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5004, debug=True)
+    selected_example = st.selectbox(
+        "Try an example question",
+        [""] + example_questions,
+    )
+
+    user_question = st.text_area(
+        "Your question",
+        value=selected_example,
+        placeholder="Example: Which service types generate the most revenue?",
+        height=110,
+    )
+
+    run_agent = st.button("Run HotelMind Agent", type="primary")
+
+    if run_agent:
+        if not user_question.strip():
+            st.error("Please enter a question first.")
+        elif not has_openai_key():
+            st.error(
+                "OpenAI API key is missing. Add it in Streamlit Cloud Secrets before running the LLM SQL Agent."
+            )
+        else:
+            with st.spinner(
+                "HotelMind is retrieving ChromaDB context, generating SQL, checking safety, and querying hotel.db..."
+            ):
+                result = answer_with_generated_sql(user_question.strip())
+
+            st.markdown("### 1. Generated SQL")
+            if result.get("sql"):
+                st.code(result["sql"], language="sql")
+            else:
+                st.info("No SQL was generated.")
+
+            st.markdown("### 2. SQL Safety QC")
+            if result.get("success"):
+                st.success(result.get("qc_message", "SQL passed safety check."))
+            else:
+                st.error(result.get("qc_message", "SQL did not pass safety check."))
+
+            st.markdown("### 3. Query Result")
+            df = result.get("dataframe")
+            if df is not None:
+                st.dataframe(df, use_container_width=True)
+
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    st.caption(f"Returned {len(df)} row(s).")
+                else:
+                    st.info("The query returned no rows.")
+            else:
+                st.warning("No dataframe to display.")
+
+            st.markdown("### 4. HotelMind Analysis")
+            st.write(result.get("analysis", "No analysis generated."))
+
+            with st.expander("Retrieved ChromaDB RAG Context"):
+                rag_context = result.get("rag_context", "")
+                if rag_context:
+                    st.text(rag_context)
+                else:
+                    st.info("No RAG context retrieved.")
+
+
+# -----------------------------
+# Tab 2: Dashboard
+# -----------------------------
+
+with tab2:
+    st.subheader("Operations Dashboard")
+
+    st.markdown(
+        """
+        This dashboard uses fixed SQL skills, so it works even before the LLM agent is configured.
+        """
+    )
+
+    try:
+        stats = get_summary_stats()
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+
+        col1.metric("Buildings", int(stats["building_count"]["count"][0]))
+        col2.metric("Total Rooms", int(stats["room_count"]["count"][0]))
+        col3.metric("Available Rooms", int(stats["available_room_count"]["count"][0]))
+        col4.metric("Events", int(stats["event_count"]["count"][0]))
+        col5.metric("Total Revenue", f"${stats['total_revenue']['total'][0]}")
+
+        st.divider()
+
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("### Revenue by Service Type")
+            service_df = revenue_by_service()
+            st.dataframe(service_df, use_container_width=True)
+
+            if not service_df.empty and "serviceType" in service_df.columns:
+                chart_df = service_df.set_index("serviceType")
+                st.bar_chart(chart_df)
+
+        with right:
+            st.markdown("### Room Status Summary")
+            status_df = room_status_summary()
+            st.dataframe(status_df, use_container_width=True)
+
+            if not status_df.empty and "roomStatus" in status_df.columns:
+                chart_status = status_df.set_index("roomStatus")
+                st.bar_chart(chart_status)
+
+        st.divider()
+
+        st.markdown("### Recent Access Logs")
+        access_df = recent_access_logs(limit=50)
+        st.dataframe(access_df, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Dashboard error: {e}")
+        st.info(
+            "Check whether `hotel.db` is in the root folder and whether the table names match your database."
+        )
+
+
+# -----------------------------
+# Tab 3: Build / Test ChromaDB
+# -----------------------------
+
+with tab3:
+    st.subheader("Build / Test ChromaDB RAG")
+
+    st.markdown(
+        """
+        This tab builds a ChromaDB vector store from your `knowledge_base/*.md` files.  
+        On Streamlit Cloud, you may need to rebuild ChromaDB after deployment or app restart.
+        """
+    )
+
+    col_build, col_note = st.columns([1, 2])
+
+    with col_build:
+        if st.button("Build / Rebuild ChromaDB", type="primary"):
+            with st.spinner("Building ChromaDB from knowledge_base markdown files..."):
+                try:
+                    build_chroma()
+                    st.success("ChromaDB built successfully.")
+                except Exception as e:
+                    st.error(f"ChromaDB build error: {e}")
+
+    with col_note:
+        st.info(
+            """
+            If retrieval returns no useful context, click **Build / Rebuild ChromaDB** first.
+            """
+        )
+
+    st.divider()
+
+    test_question = st.text_input(
+        "Enter a question to preview retrieved ChromaDB context",
+        value="Check suspicious access card logs",
+    )
+
+    if st.button("Retrieve ChromaDB Context"):
+        with st.spinner("Retrieving semantic context from ChromaDB..."):
+            try:
+                context = retrieve_context_chroma(test_question)
+                if context:
+                    st.text(context)
+                else:
+                    st.warning("No context retrieved. Try rebuilding ChromaDB first.")
+            except Exception as e:
+                st.error(f"ChromaDB retrieval error: {e}")
+                st.info("Try clicking Build / Rebuild ChromaDB first.")
+
+
+# -----------------------------
+# Tab 4: Database Schema
+# -----------------------------
+
+with tab4:
+    st.subheader("Database Schema")
+
+    st.markdown(
+        """
+        This schema is automatically read from `hotel.db`.  
+        The SQL Agent uses this schema to avoid inventing table or column names.
+        """
+    )
+
+    try:
+        schema_text = get_database_schema()
+        st.text(schema_text)
+    except Exception as e:
+        st.error(f"Schema loading error: {e}")
+        st.info("Make sure `hotel.db` exists in the root folder.")
+
+
+# -----------------------------
+# Tab 5: About Skills
+# -----------------------------
+
+with tab5:
+    st.subheader("HotelMind Skills")
+
+    st.markdown(
+        """
+        HotelMind is organized as a skill-based AI agent system.
+
+        ### Main Skills
+
+        | Skill | File | Purpose |
+        |---|---|---|
+        | ChromaDB RAG Skill | `skills/chroma_rag_skill.py` | Retrieves relevant hotel schema, rules, KPI definitions, and anomaly rules |
+        | SQL Generation Skill | `skills/sql_generation_skill.py` | Runs the full workflow from user question to final answer |
+        | Fixed Report Skill | `skills/fixed_report_skill.py` | Provides dashboard queries that work without LLM |
+        | SQL Safety QC Skill | `agent/qc_agent.py` | Blocks dangerous SQL and only allows `SELECT` |
+        | SQL Agent | `agent/sql_agent.py` | Uses an LLM to generate SQLite-compatible SQL |
+        | Analyst Agent | `agent/analyst_agent.py` | Explains query results in hotel operations language |
+        | Database Tool | `tools/db_tool.py` | Executes SQL against `hotel.db` |
+        | Schema Tool | `tools/schema_tool.py` | Reads database tables and columns |
+        """
+    )
+
+    st.markdown(
+        """
+        ### Example Workflow
+
+        ```text
+        User question
+        ↓
+        ChromaDB RAG Skill
+        ↓
+        SQL Agent generates SELECT query
+        ↓
+        SQL Safety QC checks query
+        ↓
+        Database Tool queries hotel.db
+        ↓
+        Analyst Agent explains result
+        ↓
+        Final manager-friendly answer
+        ```
+        """
+    )
+
+    st.markdown(
+        """
+        ### Suggested Demo Questions
+
+        - Which service types generate the most revenue?
+        - Show the top 10 rooms by total revenue.
+        - Show recent card access logs.
+        - Which billing parties have the highest total charges?
+        - Show event room usage by date.
+        - Find guests with multiple stays.
+        - Which events have the highest estimated attendance?
+        """
+    )
